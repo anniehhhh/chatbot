@@ -1,23 +1,40 @@
 import os
 import json
 import re
+import uuid
+import shutil
 from typing import List, Dict, Optional
 from datetime import datetime, timezone
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from groq import Groq
 from fastapi.middleware.cors import CORSMiddleware
 import requests
 from bs4 import BeautifulSoup
 
+# Import RAG modules
+from pdf_processor import PDFProcessor
+from vector_store import VectorStore
+
 load_dotenv()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID")  # Custom Search Engine ID
 
+# RAG configuration
+UPLOAD_DIR = os.getenv("UPLOAD_DIR", "./uploads")
+VECTOR_DB_PATH = os.getenv("VECTOR_DB_PATH", "./chroma_db")
+MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "10"))
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "500"))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "100"))
+
 if not GROQ_API_KEY:
     raise ValueError("GROQ_API_KEY environment variable not set")
+
+# Create upload directory if it doesn't exist
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 app = FastAPI()
 app.add_middleware(
@@ -30,10 +47,15 @@ app.add_middleware(
 
 client = Groq(api_key=GROQ_API_KEY)
 
+# Initialize RAG components
+pdf_processor = PDFProcessor(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+vector_store = VectorStore(persist_directory=VECTOR_DB_PATH)
+
 class UserInput(BaseModel):
     message: str
     role: str
     conversation_id: str
+    use_web_search: bool = False  # Optional flag for web search
 
 class Conversation:
     def __init__(self):
@@ -41,6 +63,7 @@ class Conversation:
             {"role": "system", "content": "You are a helpful assistant."}
         ]
         self.active: bool = True
+        self.document_ids: List[str] = []  # Track uploaded documents for this conversation
 
 conversations: Dict[str, Conversation] = {}
 
@@ -235,13 +258,19 @@ def extract_text_from_url(url: str, char_limit: int = 4000) -> str:
 
 def enrich_search_results_with_extraction(snippets: List[Dict[str, str]]) -> List[Dict[str, str]]:
     enriched = []
-    for item in snippets:
+    for i, item in enumerate(snippets, 1):
         link = item.get("link")
         extracted = ""
         if link:
             try:
+                print(f"  📄 Extracting from result {i}: {link[:60]}...")
                 extracted = extract_text_from_url(link)
-            except Exception:
+                if extracted:
+                    print(f"    ✅ Extracted {len(extracted)} characters")
+                else:
+                    print(f"    ⚠️  No content extracted (empty)")
+            except Exception as e:
+                print(f"    ❌ Extraction failed: {e}")
                 extracted = ""
         enriched.append({
             "title": item.get("title"),
@@ -253,31 +282,55 @@ def enrich_search_results_with_extraction(snippets: List[Dict[str, str]]) -> Lis
 
 
 # ---------------- Build final messages for Groq ----------------
-def build_refinement_messages(conversation: Conversation, user_message: str, *, search_results: Optional[List[Dict[str, str]]] = None) -> List[Dict[str, str]]:
+def build_refinement_messages(conversation: Conversation, user_message: str, *, search_results: Optional[List[Dict[str, str]]] = None, rag_context: Optional[List[Dict]] = None) -> List[Dict[str, str]]:
     timestamp = get_iso_timestamp()
 
+    # Build intelligent system prompt
+    if search_results:
+        system_content = """You are a helpful assistant. Answer the user's question using the web search results provided below. Be direct and informative."""
+    elif rag_context:
+        system_content = """You are a helpful assistant. Answer the user's question using the document content provided below."""
+    else:
+        system_content = """You are a helpful assistant. Answer the user's question using your knowledge. If you don't know something, say so."""
+    
     system_msg = {
         "role": "system",
-        "content": "You are a highly intelligent, friendly, and conversational assistant.Use the conversation naturally and answer like a human expert, not like a report generator.If web search results are provided, use them silently to improve accuracy.Only mention sources if the user explicitly asks for them. If some data could not be fetched, do NOT apologize or explain system limitations.Instead, answer with the best available information in a confident, clear, natural tone. If exact data is unavailable, approximate using the most recent or closest reliable information without mentioning system failure or limitations."
+        "content": system_content
     }
 
-    context_msg = {"role": "user", "content": f"Timestamp: {timestamp}\nConversation context: {json.dumps(conversation.messages)}\nUser message: {user_message}"}
+    # Simplified context message (removed verbose conversation dump for speed)
+    context_msg = {
+        "role": "user", 
+        "content": f"Current time: {timestamp}\nUser question: {user_message}"
+    }
 
-    messages = [system_msg, context_msg]
+    # Build messages with full conversation history for context awareness
+    messages = [system_msg]
+    
+    # Add conversation history (excluding the system message we already added)
+    for msg in conversation.messages[1:]:  # Skip first system message
+        messages.append(msg)
+    
+    # Add current context
+    messages.append(context_msg)
+    
+    # Add RAG context if available (simplified format)
+    if rag_context:
+        rag_text = "Uploaded Document Content:\n"
+        for i, ctx in enumerate(rag_context, 1):
+            rag_text += f"\n[Excerpt {i}]: {ctx['chunk']}\n"
+        messages.append({"role": "assistant", "content": rag_text})
 
+    # Add web search results if available (simplified for speed)
     if search_results:
-        trimmed_results = []
-        for r in search_results:
-            trimmed_results.append({
-                "title": r.get("title"),
-                "link": r.get("link"),
-                "snippet": (r.get("snippet") or "")[:300],
-                "extracted_text": (r.get("extracted_text") or "")[:2000]
-            })
-        results_text = json.dumps(trimmed_results, ensure_ascii=False)
-        messages.append({"role": "assistant", "content": f"Search results with extracted text: {results_text}"})
+        search_text = "Web Search Results:\n"
+        for i, r in enumerate(search_results[:3], 1):  # Limit to top 3 for speed
+            search_text += f"\n{i}. {r.get('title', 'N/A')}\n"
+            search_text += f"   {r.get('snippet', '')[:200]}\n"
+        messages.append({"role": "assistant", "content": search_text})
 
-    messages.append({"role": "user", "content": "Please provide a clear answer using the context and the search results above (if any). If you used extracted page text, indicate which result (title or link) you used for key facts and include brief citations."})
+    # Simple instruction for response
+    messages.append({"role": "user", "content": "Answer the question based on the information provided."})
 
     return messages
 
@@ -296,52 +349,266 @@ async def chat(input: UserInput):
         "content": input.message
     })
 
-    # STEP A: Classify whether a web search is required
-    classification = classify_need_search(conversation, input.message)
-
-    try:
-        if classification.get("search"):
-            # STEP B: generate optimized search query using Groq
+    # Check if there are uploaded documents for RAG
+    rag_context = None
+    if conversation.document_ids:
+        try:
+            # Create query embedding
+            query_embedding = pdf_processor.create_query_embedding(input.message)
+            
+            # Use hybrid query for better mid-page content retrieval
+            rag_results = vector_store.hybrid_query(
+                query_embedding=query_embedding,
+                query_text=input.message,
+                top_k=5
+            )
+            
+            # Check relevance: only use RAG if top result is actually relevant
+            # Cosine distance: 0 = identical, 2 = opposite
+            # If distance > 0.6, the question is probably not about the document
+            if rag_results and len(rag_results) > 0:
+                top_distance = rag_results[0].get('distance', 1.0)
+                if top_distance <= 0.6:  # Only use if reasonably relevant
+                    rag_context = rag_results
+                else:
+                    # Question is generic, don't use document context
+                    print(f"RAG context not relevant (distance: {top_distance:.2f}), using general knowledge")
+                    rag_context = None
+            
+        except Exception as e:
+            # Continue without RAG if it fails
+            print(f"RAG query failed: {e}")
+            rag_context = None
+    
+    # Perform web search only if explicitly requested by user
+    search_results = None
+    if input.use_web_search:
+        print(f"🔍 Web search triggered for query: {input.message}")
+        try:
             timestamp = get_iso_timestamp()
-            optimized_query = generate_search_query_via_groq(conversation, input.message, timestamp=timestamp)
+            
+            # Generate optimized search query
+            search_query = generate_search_query_via_groq(conversation, input.message, timestamp)
+            print(f"📝 Generated search query: {search_query}")
+            
+            # Perform Google Custom Search
+            print(f"🌐 Calling Google Custom Search API...")
+            snippets = google_search_snippets(search_query, num_results=5, timestamp_iso=timestamp)
+            print(f"✅ Got {len(snippets)} search results")
+            
+            # Enrich with page extraction
+            print(f"📄 Extracting page content...")
+            search_results = enrich_search_results_with_extraction(snippets)
+            print(f"✅ Web search completed successfully")
+        except Exception as e:
+            # Continue without search if it fails
+            print(f"❌ Web search failed: {type(e).__name__}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            search_results = None
+    
+    # Build messages for Groq with RAG context and/or search results
+    try:
+        messages = build_refinement_messages(
+            conversation, 
+            input.message, 
+            search_results=search_results,
+            rag_context=rag_context
+        )
+        
+        # Generate response using Groq (optimized for speed and accuracy)
+        response = groq_chat(messages, temperature=0.5, max_tokens=1024, stream=False)
+        
+        # Append assistant response to conversation
+        conversation.messages.append({
+            "role": "assistant",
+            "content": response
+        })
+        
+        # Return response with metadata
+        return {
+            "response": response,
+            "used_rag": rag_context is not None and len(rag_context) > 0,
+            "used_search": search_results is not None and len(search_results) > 0
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generating response: {str(e)}")
 
-            # STEP C: use optimized query to call Google Custom Search
-            try:
-                snippets = google_search_snippets(optimized_query, num_results=5, timestamp_iso=timestamp)
-            except Exception:
-                snippets = []
 
-            # STEP D: fetch pages and extract text
-            enriched = enrich_search_results_with_extraction(snippets)
+# ---------------- RAG Endpoints ----------------
 
-            # STEP E: send enriched results + context to Groq for refined answer
-            messages_for_groq = build_refinement_messages(conversation, input.message, search_results=enriched)
-            final_answer = groq_chat(messages_for_groq, temperature=0.7, max_tokens=1000, stream=False)
-
-            conversation.messages.append({"role": "assistant", "content": final_answer})
-
-            return {
-                "response": final_answer,
-                "conversation_id": input.conversation_id,
-                "used_search": True,
-                "classification_reason": classification.get("reason"),
-                "optimized_query": optimized_query,
-                "search_results_count": len(enriched)
+@app.post("/upload-pdf")
+async def upload_pdf(file: UploadFile = File(...), conversation_id: str = "default"):
+    """
+    Upload and process a PDF file for RAG.
+    """
+    try:
+        # Validate file type
+        if not file.filename.endswith('.pdf'):
+            raise HTTPException(status_code=400, detail="Only PDF files are allowed")
+        
+        # Check file size
+        file_content = await file.read()
+        file_size_mb = len(file_content) / (1024 * 1024)
+        
+        if file_size_mb > MAX_FILE_SIZE_MB:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"File size exceeds maximum allowed size of {MAX_FILE_SIZE_MB}MB"
+            )
+        
+        # Generate unique document ID
+        doc_id = str(uuid.uuid4())
+        
+        # Save file to disk
+        file_path = os.path.join(UPLOAD_DIR, f"{doc_id}.pdf")
+        with open(file_path, 'wb') as f:
+            f.write(file_content)
+        
+        # Process PDF
+        try:
+            result = pdf_processor.process_pdf(file_path)
+            
+            # Store in vector database
+            metadata = {
+                "filename": file.filename,
+                "upload_date": get_iso_timestamp(),
+                "conversation_id": conversation_id,
+                "file_size_mb": round(file_size_mb, 2)
             }
-        else:
-            # No web search required
-            messages_for_groq = build_refinement_messages(conversation, input.message, search_results=None)
-            final_answer = groq_chat(messages_for_groq, temperature=0.7, max_tokens=800, stream=False)
-
-            conversation.messages.append({"role": "assistant", "content": final_answer})
-
-            return {"response": final_answer, "conversation_id": input.conversation_id, "used_search": False, "classification_reason": classification.get("reason")}
-
+            
+            vector_store.add_document(
+                doc_id=doc_id,
+                chunks=result["chunks"],
+                embeddings=result["embeddings"],
+                metadata=metadata
+            )
+            
+            # Add document to conversation
+            conversation = get_or_create_conversation(conversation_id)
+            if doc_id not in conversation.document_ids:
+                conversation.document_ids.append(doc_id)
+            
+            return {
+                "success": True,
+                "doc_id": doc_id,
+                "filename": file.filename,
+                "num_chunks": result["num_chunks"],
+                "message": f"Successfully processed {file.filename}"
+            }
+        
+        except Exception as e:
+            # Clean up file if processing failed
+            if os.path.exists(file_path):
+                os.remove(file_path)
+            raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
+    
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/documents")
+async def list_documents(conversation_id: Optional[str] = None):
+    """
+    List all uploaded documents, optionally filtered by conversation.
+    """
+    try:
+        all_docs = vector_store.list_documents()
+        
+        # Filter by conversation if specified
+        if conversation_id:
+            conversation = conversations.get(conversation_id)
+            if conversation:
+                all_docs = [
+                    doc for doc in all_docs 
+                    if doc["doc_id"] in conversation.document_ids
+                ]
+        
+        return {
+            "documents": all_docs,
+            "count": len(all_docs)
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/documents/{doc_id}")
+async def delete_document(doc_id: str, conversation_id: Optional[str] = None):
+    """
+    Delete a document from the vector store and file system.
+    """
+    try:
+        # Delete from vector store
+        success = vector_store.delete_document(doc_id)
+        
+        if not success:
+            raise HTTPException(status_code=404, detail="Document not found")
+        
+        # Delete file from disk
+        file_path = os.path.join(UPLOAD_DIR, f"{doc_id}.pdf")
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        
+        # Remove from conversation
+        if conversation_id and conversation_id in conversations:
+            conversation = conversations[conversation_id]
+            if doc_id in conversation.document_ids:
+                conversation.document_ids.remove(doc_id)
+        
+        return {
+            "success": True,
+            "message": "Document deleted successfully"
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.on_event("shutdown")
+async def cleanup_on_shutdown():
+    """
+    Clean up all uploaded documents and vector store when server shuts down.
+    """
+    try:
+        print("Server shutting down - cleaning up documents...")
+        
+        # Delete all documents from vector store
+        all_docs = vector_store.list_documents()
+        for doc in all_docs:
+            try:
+                vector_store.delete_document(doc["doc_id"])
+            except Exception as e:
+                print(f"Error deleting document {doc['doc_id']}: {e}")
+        
+        # Clear upload directory
+        if os.path.exists(UPLOAD_DIR):
+            try:
+                shutil.rmtree(UPLOAD_DIR)
+                os.makedirs(UPLOAD_DIR, exist_ok=True)
+            except Exception as e:
+                print(f"Error clearing upload directory: {e}")
+        
+        # Clear vector database
+        if os.path.exists(VECTOR_DB_PATH):
+            try:
+                shutil.rmtree(VECTOR_DB_PATH)
+            except Exception as e:
+                print(f"Error clearing vector database: {e}")
+        
+        # Clear conversations
+        conversations.clear()
+        
+        print("Cleanup completed successfully")
+    except Exception as e:
+        print(f"Error during cleanup: {e}")
 
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-

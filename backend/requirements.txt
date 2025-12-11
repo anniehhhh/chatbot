@@ -7,3 +7,10 @@ langchain-core
 langchain-groq
 groq
 python-dotenv
+PyPDF2
+chromadb
+sentence-transformers
+langchain-text-splitters
+python-multipart
+beautifulsoup4
+requests
